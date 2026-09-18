@@ -3,7 +3,7 @@
 #include <mod/config.h>
 #include <mod/logger.h>
 
-MYMODCFGNAME(net.groot.advanceddrift, GTA:SA Advanced Drift, 1.0, groot, advanceddrift)
+MYMODCFGNAME(net.groot.advanceddrift, GTA:SA Advanced Drift, 1.1, groot, advanceddrift)
 NEEDGAME(com.rockstargames.gtasa)
 
 BEGIN_DEPLIST()
@@ -14,10 +14,11 @@ uintptr_t pGTASA = 0;
 void *hGTASA = nullptr;
 
 // --- Configurable Variables ---
-float fSlideMomentum = 1.025f;       // Counters handbrake friction to maintain slide speed
-float fSteerDriftMultiplier = 0.05f; // How aggressively steering rotates the car during a drift
-float fMinDriftSpeed = 0.20f;        // Minimum forward speed required to initiate drift
-float fMaxDriftSpeed = 1.50f;        // Safety cap to prevent infinite acceleration during long drifts
+// 0.998 perfectly mimics a smooth arcade drift (losing only a tiny fraction of speed per frame).
+float fSlideMomentum = 0.998f;       
+float fSteerDriftMultiplier = 0.025f; // Increased rotational assist for whipping the tail out
+float fMinDriftSpeed = 0.15f;        
+float fMaxDriftSpeed = 1.50f;        
 
 // --- Vector Struct ---
 struct CVector {
@@ -50,34 +51,68 @@ constexpr size_t OFFSET_TURN_SPEED = 0x50;
 // Hook: CAutomobile::ProcessControl
 // -----------------------------------------------------------------------------
 DECL_HOOKv(AutomobileProcessControl, void* pAutomobile) {
-    AutomobileProcessControl(pAutomobile);
-
-    if (!pAutomobile || !FindPlayerVehicle || !GetPad || !GetHandbrake || !GetSteeringLeftRight) return;
+    // 1. Safety check for required symbols
+    if (!pAutomobile || !FindPlayerVehicle || !GetPad || !GetHandbrake || !GetSteeringLeftRight) {
+        AutomobileProcessControl(pAutomobile);
+        return;
+    }
 
     void* pPlayerCar = FindPlayerVehicle(-1, false);
-    if (pAutomobile != pPlayerCar) return;
+    bool bIsPlayer = (pAutomobile == pPlayerCar);
+    
+    bool bDriftAttempt = false;
+    float oldSpeed = 0.0f;
+    CVector* pMoveSpeed = nullptr;
+    CVector* pTurnSpeed = nullptr;
+    void* pPad = nullptr;
 
-    void* pPad = GetPad(0);
-    if (!pPad || !GetHandbrake(pPad)) return;
+    // 2. PRE-PROCESS: Capture the car's momentum BEFORE the game applies handbrake friction
+    if (bIsPlayer) {
+        pPad = GetPad(0);
+        // GetHandbrake only triggers on the dedicated handbrake, NOT the reverse/brake pedal
+        if (pPad && GetHandbrake(pPad)) {
+            pMoveSpeed = reinterpret_cast<CVector*>(reinterpret_cast<uintptr_t>(pAutomobile) + OFFSET_MOVE_SPEED);
+            pTurnSpeed = reinterpret_cast<CVector*>(reinterpret_cast<uintptr_t>(pAutomobile) + OFFSET_TURN_SPEED);
+            
+            if (pMoveSpeed && pTurnSpeed) {
+                oldSpeed = std::sqrt(pMoveSpeed->x * pMoveSpeed->x + pMoveSpeed->y * pMoveSpeed->y);
+                if (oldSpeed > fMinDriftSpeed) {
+                    bDriftAttempt = true;
+                }
+            }
+        }
+    }
 
-    CVector* pMoveSpeed = reinterpret_cast<CVector*>(reinterpret_cast<uintptr_t>(pAutomobile) + OFFSET_MOVE_SPEED);
-    CVector* pTurnSpeed = reinterpret_cast<CVector*>(reinterpret_cast<uintptr_t>(pAutomobile) + OFFSET_TURN_SPEED);
+    // 3. PROCESS: Let the game apply its steering, suspension, and handbrake logic
+    AutomobileProcessControl(pAutomobile);
 
-    if (!pMoveSpeed || !pTurnSpeed) return;
+    // 4. POST-PROCESS: Inject our Arcade Drift Physics
+    if (bDriftAttempt && pMoveSpeed && pTurnSpeed) {
+        float newSpeed = std::sqrt(pMoveSpeed->x * pMoveSpeed->x + pMoveSpeed->y * pMoveSpeed->y);
+        
+        // Crash Detection: If speed drops by >50% in one frame, the car hit a wall. Do NOT force momentum.
+        if (newSpeed > (oldSpeed * 0.50f)) {
+            
+            // Calculate target speed to perfectly cancel out the heavy handbrake friction
+            float targetSpeed = oldSpeed * fSlideMomentum;
+            if (targetSpeed > fMaxDriftSpeed) {
+                targetSpeed = fMaxDriftSpeed;
+            }
 
-    float currentSpeed = std::sqrt(pMoveSpeed->x * pMoveSpeed->x + pMoveSpeed->y * pMoveSpeed->y);
+            // Restore the velocity magnitude without changing the new slide direction
+            if (newSpeed > 0.001f) {
+                float ratio = targetSpeed / newSpeed;
+                pMoveSpeed->x *= ratio;
+                pMoveSpeed->y *= ratio;
+            }
+        }
 
-    if (currentSpeed > fMinDriftSpeed) {
+        // Apply Highly Assisted Yaw (Rotation) to whip the tail out when steering left/right
         int steerInputRaw = GetSteeringLeftRight(pPad);
         float steerNorm = static_cast<float>(steerInputRaw) / 128.0f;
 
-        if (std::abs(steerNorm) > 0.05f) {
+        if (std::abs(steerNorm) > 0.05f) { // Small deadzone
             pTurnSpeed->z -= (steerNorm * fSteerDriftMultiplier);
-        }
-
-        if (currentSpeed < fMaxDriftSpeed) {
-            pMoveSpeed->x *= fSlideMomentum;
-            pMoveSpeed->y *= fSlideMomentum;
         }
     }
 }
@@ -87,22 +122,24 @@ ON_MOD_PRELOAD() {
 }
 
 ON_MOD_LOAD() {
-    fSlideMomentum = cfg->GetFloat("SlideMomentum", fSlideMomentum, "Drift");
-    fSteerDriftMultiplier = cfg->GetFloat("SteerDriftMultiplier", fSteerDriftMultiplier, "Drift");
-    fMinDriftSpeed = cfg->GetFloat("MinDriftSpeed", fMinDriftSpeed, "Drift");
-    fMaxDriftSpeed = cfg->GetFloat("MaxDriftSpeed", fMaxDriftSpeed, "Drift");
+    // Read from [AdvancedDrift] config section
+    fSlideMomentum = cfg->GetFloat("SlideMomentum", fSlideMomentum, "AdvancedDrift");
+    fSteerDriftMultiplier = cfg->GetFloat("SteerDriftMultiplier", fSteerDriftMultiplier, "AdvancedDrift");
+    fMinDriftSpeed = cfg->GetFloat("MinDriftSpeed", fMinDriftSpeed, "AdvancedDrift");
+    fMaxDriftSpeed = cfg->GetFloat("MaxDriftSpeed", fMaxDriftSpeed, "AdvancedDrift");
 
     pGTASA = aml->GetLib("libGTASA.so");
     hGTASA = aml->GetLibHandle("libGTASA.so");
 
     if (!pGTASA || !hGTASA) return;
 
+    // Resolve Symbols
     FindPlayerVehicle = reinterpret_cast<fnFindPlayerVehicle>(aml->GetSym(hGTASA, "_Z17FindPlayerVehicleib"));
     GetPad = reinterpret_cast<fnGetPad>(aml->GetSym(hGTASA, "_ZN4CPad6GetPadEi"));
     GetHandbrake = reinterpret_cast<fnGetHandbrake>(aml->GetSym(hGTASA, "_ZN4CPad12GetHandbrakeEv"));
     GetSteeringLeftRight = reinterpret_cast<fnGetSteeringLeftRight>(aml->GetSym(hGTASA, "_ZN4CPad20GetSteeringLeftRightEv"));
 
-    // Fixed: Declared as uintptr_t directly to match GetSym's return type in NDK r29
+    // Cast explicitly to uintptr_t to satisfy strict NDK rules
     uintptr_t pProcessControl = aml->GetSym(hGTASA, "_ZN11CAutomobile14ProcessControlEv");
     if (pProcessControl) {
         HOOK(AutomobileProcessControl, pProcessControl);
