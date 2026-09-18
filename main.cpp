@@ -3,7 +3,7 @@
 #include <mod/config.h>
 #include <mod/logger.h>
 
-MYMODCFGNAME(net.groot.advanceddrift, GTA:SA Advanced Drift, 1.1, groot, advanceddrift)
+MYMODCFGNAME(net.groot.advanceddrift, GTA:SA Advanced Drift, 1.3, groot, advanceddrift)
 NEEDGAME(com.rockstargames.gtasa)
 
 BEGIN_DEPLIST()
@@ -11,12 +11,10 @@ ADD_DEPENDENCY_VER(net.rusjj.aml, 1.4.0)
 END_DEPLIST()
 
 uintptr_t pGTASA = 0;
-void *hGTASA = nullptr;
 
 // --- Configurable Variables ---
-// 0.998 perfectly mimics a smooth arcade drift (losing only a tiny fraction of speed per frame).
 float fSlideMomentum = 0.998f;       
-float fSteerDriftMultiplier = 0.025f; // Increased rotational assist for whipping the tail out
+float fSteerDriftMultiplier = 0.035f; 
 float fMinDriftSpeed = 0.15f;        
 float fMaxDriftSpeed = 1.50f;        
 
@@ -32,87 +30,103 @@ fnFindPlayerVehicle FindPlayerVehicle = nullptr;
 using fnGetPad = void* (*)(int padIndex);
 fnGetPad GetPad = nullptr;
 
-using fnGetHandbrake = bool (*)(void* pPad);
-fnGetHandbrake GetHandbrake = nullptr;
-
 using fnGetSteeringLeftRight = int (*)(void* pPad);
 fnGetSteeringLeftRight GetSteeringLeftRight = nullptr;
 
-// --- Entity Offsets ---
+// ==============================================================================
+// DIRECT MEMORY OFFSETS FROM YOUR `nm` OUTPUT
+// ==============================================================================
 #if defined(__aarch64__)
+// 64-Bit (ARM64) Offsets
+constexpr uintptr_t OFF_ProcessControl       = 0x0067459C; 
+constexpr uintptr_t OFF_FindPlayerVehicle    = 0x004EFDEC; 
+constexpr uintptr_t OFF_GetPad               = 0x004DB628; 
+constexpr uintptr_t OFF_GetSteeringLeftRight = 0x004DC4F0; 
+
 constexpr size_t OFFSET_MOVE_SPEED = 0x58;
 constexpr size_t OFFSET_TURN_SPEED = 0x64;
+constexpr size_t OFFSET_HANDBRAKE  = 0x0C; // RightShoulder1 / Handbrake in CPad struct
 #else
+// 32-Bit (ARMv7) Offsets
+constexpr uintptr_t OFF_ProcessControl       = 0x00553DD4; 
+constexpr uintptr_t OFF_FindPlayerVehicle    = 0x0040B530; 
+constexpr uintptr_t OFF_GetPad               = 0x003F8CA4; 
+constexpr uintptr_t OFF_GetSteeringLeftRight = 0x003F9B04; 
+
 constexpr size_t OFFSET_MOVE_SPEED = 0x44;
 constexpr size_t OFFSET_TURN_SPEED = 0x50;
+constexpr size_t OFFSET_HANDBRAKE  = 0x0C; // RightShoulder1 / Handbrake in CPad struct
 #endif
+// ==============================================================================
+
+// Helper to safely read handbrake directly from CPad memory
+bool IsHandbrakePressed(void* pPad) {
+    if (!pPad) return false;
+    // Reads CControllerState::RightShoulder1 (Handbrake input on Android touch/controller)
+    int16_t handbrakeVal = *reinterpret_cast<int16_t*>(reinterpret_cast<uintptr_t>(pPad) + OFFSET_HANDBRAKE);
+    return handbrakeVal > 0;
+}
 
 // -----------------------------------------------------------------------------
 // Hook: CAutomobile::ProcessControl
 // -----------------------------------------------------------------------------
 DECL_HOOKv(AutomobileProcessControl, void* pAutomobile) {
-    // 1. Safety check for required symbols
-    if (!pAutomobile || !FindPlayerVehicle || !GetPad || !GetHandbrake || !GetSteeringLeftRight) {
+    if (!pAutomobile || !FindPlayerVehicle || !GetPad || !GetSteeringLeftRight) {
         AutomobileProcessControl(pAutomobile);
         return;
     }
 
     void* pPlayerCar = FindPlayerVehicle(-1, false);
-    bool bIsPlayer = (pAutomobile == pPlayerCar);
+    if (pAutomobile != pPlayerCar) {
+        AutomobileProcessControl(pAutomobile);
+        return;
+    }
     
     bool bDriftAttempt = false;
     float oldSpeed = 0.0f;
-    CVector* pMoveSpeed = nullptr;
-    CVector* pTurnSpeed = nullptr;
-    void* pPad = nullptr;
+    void* pPad = GetPad(0);
 
-    // 2. PRE-PROCESS: Capture the car's momentum BEFORE the game applies handbrake friction
-    if (bIsPlayer) {
-        pPad = GetPad(0);
-        // GetHandbrake only triggers on the dedicated handbrake, NOT the reverse/brake pedal
-        if (pPad && GetHandbrake(pPad)) {
-            pMoveSpeed = reinterpret_cast<CVector*>(reinterpret_cast<uintptr_t>(pAutomobile) + OFFSET_MOVE_SPEED);
-            pTurnSpeed = reinterpret_cast<CVector*>(reinterpret_cast<uintptr_t>(pAutomobile) + OFFSET_TURN_SPEED);
-            
-            if (pMoveSpeed && pTurnSpeed) {
-                oldSpeed = std::sqrt(pMoveSpeed->x * pMoveSpeed->x + pMoveSpeed->y * pMoveSpeed->y);
-                if (oldSpeed > fMinDriftSpeed) {
-                    bDriftAttempt = true;
-                }
+    // 1. Check Handbrake directly from memory before physics calculations
+    if (pPad && IsHandbrakePressed(pPad)) {
+        CVector* pMoveSpeed = reinterpret_cast<CVector*>(reinterpret_cast<uintptr_t>(pAutomobile) + OFFSET_MOVE_SPEED);
+        if (pMoveSpeed) {
+            oldSpeed = std::sqrt(pMoveSpeed->x * pMoveSpeed->x + pMoveSpeed->y * pMoveSpeed->y);
+            if (oldSpeed > fMinDriftSpeed) {
+                bDriftAttempt = true;
             }
         }
     }
 
-    // 3. PROCESS: Let the game apply its steering, suspension, and handbrake logic
+    // 2. Process standard game engine physics
     AutomobileProcessControl(pAutomobile);
 
-    // 4. POST-PROCESS: Inject our Arcade Drift Physics
-    if (bDriftAttempt && pMoveSpeed && pTurnSpeed) {
-        float newSpeed = std::sqrt(pMoveSpeed->x * pMoveSpeed->x + pMoveSpeed->y * pMoveSpeed->y);
+    // 3. Inject Drift Physics Post-Process
+    if (bDriftAttempt) {
+        CVector* pMoveSpeed = reinterpret_cast<CVector*>(reinterpret_cast<uintptr_t>(pAutomobile) + OFFSET_MOVE_SPEED);
+        CVector* pTurnSpeed = reinterpret_cast<CVector*>(reinterpret_cast<uintptr_t>(pAutomobile) + OFFSET_TURN_SPEED);
         
-        // Crash Detection: If speed drops by >50% in one frame, the car hit a wall. Do NOT force momentum.
-        if (newSpeed > (oldSpeed * 0.50f)) {
+        if (pMoveSpeed && pTurnSpeed) {
+            float newSpeed = std::sqrt(pMoveSpeed->x * pMoveSpeed->x + pMoveSpeed->y * pMoveSpeed->y);
             
-            // Calculate target speed to perfectly cancel out the heavy handbrake friction
-            float targetSpeed = oldSpeed * fSlideMomentum;
-            if (targetSpeed > fMaxDriftSpeed) {
-                targetSpeed = fMaxDriftSpeed;
+            // Maintain momentum if car didn't hit a wall
+            if (newSpeed > (oldSpeed * 0.50f)) {
+                float targetSpeed = oldSpeed * fSlideMomentum;
+                if (targetSpeed > fMaxDriftSpeed) targetSpeed = fMaxDriftSpeed;
+
+                if (newSpeed > 0.001f) {
+                    float ratio = targetSpeed / newSpeed;
+                    pMoveSpeed->x *= ratio;
+                    pMoveSpeed->y *= ratio;
+                }
             }
 
-            // Restore the velocity magnitude without changing the new slide direction
-            if (newSpeed > 0.001f) {
-                float ratio = targetSpeed / newSpeed;
-                pMoveSpeed->x *= ratio;
-                pMoveSpeed->y *= ratio;
+            // Apply steering rotation assist during drift
+            int steerInputRaw = GetSteeringLeftRight(pPad);
+            float steerNorm = static_cast<float>(steerInputRaw) / 128.0f;
+
+            if (std::abs(steerNorm) > 0.05f) { 
+                pTurnSpeed->z -= (steerNorm * fSteerDriftMultiplier);
             }
-        }
-
-        // Apply Highly Assisted Yaw (Rotation) to whip the tail out when steering left/right
-        int steerInputRaw = GetSteeringLeftRight(pPad);
-        float steerNorm = static_cast<float>(steerInputRaw) / 128.0f;
-
-        if (std::abs(steerNorm) > 0.05f) { // Small deadzone
-            pTurnSpeed->z -= (steerNorm * fSteerDriftMultiplier);
         }
     }
 }
@@ -122,28 +136,19 @@ ON_MOD_PRELOAD() {
 }
 
 ON_MOD_LOAD() {
-    // Read from [AdvancedDrift] config section
     fSlideMomentum = cfg->GetFloat("SlideMomentum", fSlideMomentum, "AdvancedDrift");
     fSteerDriftMultiplier = cfg->GetFloat("SteerDriftMultiplier", fSteerDriftMultiplier, "AdvancedDrift");
     fMinDriftSpeed = cfg->GetFloat("MinDriftSpeed", fMinDriftSpeed, "AdvancedDrift");
     fMaxDriftSpeed = cfg->GetFloat("MaxDriftSpeed", fMaxDriftSpeed, "AdvancedDrift");
 
     pGTASA = aml->GetLib("libGTASA.so");
-    hGTASA = aml->GetLibHandle("libGTASA.so");
+    if (!pGTASA) return;
 
-    if (!pGTASA || !hGTASA) return;
+    // Direct function assignment via base + offset
+    FindPlayerVehicle = reinterpret_cast<fnFindPlayerVehicle>(pGTASA + OFF_FindPlayerVehicle);
+    GetPad = reinterpret_cast<fnGetPad>(pGTASA + OFF_GetPad);
+    GetSteeringLeftRight = reinterpret_cast<fnGetSteeringLeftRight>(pGTASA + OFF_GetSteeringLeftRight);
 
-    // Resolve Symbols
-    FindPlayerVehicle = reinterpret_cast<fnFindPlayerVehicle>(aml->GetSym(hGTASA, "_Z17FindPlayerVehicleib"));
-    GetPad = reinterpret_cast<fnGetPad>(aml->GetSym(hGTASA, "_ZN4CPad6GetPadEi"));
-    GetHandbrake = reinterpret_cast<fnGetHandbrake>(aml->GetSym(hGTASA, "_ZN4CPad12GetHandbrakeEv"));
-    GetSteeringLeftRight = reinterpret_cast<fnGetSteeringLeftRight>(aml->GetSym(hGTASA, "_ZN4CPad20GetSteeringLeftRightEv"));
-
-    // Cast explicitly to uintptr_t to satisfy strict NDK rules
-    uintptr_t pProcessControl = aml->GetSym(hGTASA, "_ZN11CAutomobile14ProcessControlEv");
-    if (pProcessControl) {
-        HOOK(AutomobileProcessControl, pProcessControl);
-    } else {
-        logger->Error("Failed to resolve CAutomobile::ProcessControl");
-    }
+    uintptr_t pProcessControlAddr = pGTASA + OFF_ProcessControl;
+    HOOK(AutomobileProcessControl, pProcessControlAddr);
 }
